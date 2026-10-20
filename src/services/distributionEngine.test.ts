@@ -7,6 +7,7 @@ import {
 class MockDistributionRepo {
   public runs: any[] = [];
   public payouts: any[] = [];
+  public allocations: any[] = [];
   public failNextRunCount = 0;
   public failNextPayoutCount = 0;
   public failSpecificPayouts: number[] = []; // indices of payouts that should fail
@@ -48,6 +49,20 @@ class MockDistributionRepo {
     };
     this.runs.push(run);
     return run;
+  }
+
+  async createAllocations(runId: string, allocations: any[]): Promise<any[]> {
+    const created = allocations.map((a, i) => ({
+      id: `a-${this.allocations.length + i + 1}`,
+      distribution_id: runId,
+      ...a,
+    }));
+    this.allocations.push(...created);
+    return created;
+  }
+
+  async getAllocationsForRun(runId: string): Promise<any[]> {
+    return this.allocations.filter(a => a.distribution_id === runId);
   }
 
   async createPayout(input: any, client?: any): Promise<any> {
@@ -165,6 +180,54 @@ describe('DistributionEngine', () => {
     expect(repo.payouts).toHaveLength(2); // Now both payouts
     expect(repo.runs[0].status).toBe('completed');
     expect(res2.payouts).toHaveLength(2);
+  });
+
+  it('resumes using persisted allocations even when balances change', async () => {
+    const repo = new MockDistributionRepo();
+    const originalBalances = [
+      { investor_id: 'i1', balance: 50 },
+      { investor_id: 'i2', balance: 50 },
+    ];
+
+    repo.failSpecificPayouts = [1];
+
+    const engine = new DistributionEngine(
+      null,
+      repo,
+      new MockBalanceProvider(originalBalances),
+      { maxRetries: 1, initialDelayMs: 0 },
+    );
+
+    const period = { id: 'p-resume-plan', start: new Date(), end: new Date() };
+
+    await expect(engine.distribute('off-resume-plan', period, 100)).rejects.toThrow();
+    expect(repo.payouts).toHaveLength(1);
+    expect(repo.runs[0].status).toBe('failed');
+
+    // Balances change between attempts: i2 leaves, i3 arrives
+    const changedBalances = [
+      { investor_id: 'i1', balance: 100 },
+      { investor_id: 'i3', balance: 100 },
+    ];
+
+    repo.failSpecificPayouts = [];
+    const engine2 = new DistributionEngine(
+      null,
+      repo,
+      new MockBalanceProvider(changedBalances),
+      { maxRetries: 1, initialDelayMs: 0 },
+    );
+
+    const res2 = await engine2.distribute('off-resume-plan', period, 100);
+
+    expect(repo.runs).toHaveLength(1);
+    expect(repo.payouts).toHaveLength(2);
+    const byInvestor = Object.fromEntries(res2.payouts.map(p => [p.investor_id, p.amount]));
+    expect(byInvestor).toEqual({ i1: '50.00', i2: '50.00' });
+    expect(byInvestor['i3']).toBeUndefined();
+    const sum = res2.payouts.reduce((s, p) => s + Number(p.amount), 0);
+    expect(sum).toBe(100);
+    expect(repo.runs[0].status).toBe('completed');
   });
 
   it('classifies and retries Stellar RPC failures', async () => {

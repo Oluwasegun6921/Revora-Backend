@@ -380,6 +380,7 @@ class DistributionEngine {
       amtStr,
     );
 
+    let persistedPlan: Array<{ investor_id: string; amount: string }> | null = null;
     if (run) {
       if (run.status === "completed") {
         this.logger.info(
@@ -409,36 +410,75 @@ class DistributionEngine {
         runId: run.id,
         currentStatus: run.status,
       });
+
+      // On resume, load the persisted allocation plan instead of recomputing
+      // from fresh balances. Recomputing would mix proration bases and could
+      // pay a newly-arrived holder for a period they did not hold.
+      if (typeof this.distributionRepo.getAllocationsForRun === "function") {
+        const allocations = await this.distributionRepo.getAllocationsForRun(
+          run.id,
+        );
+        if (allocations && allocations.length > 0) {
+          persistedPlan = allocations.map((a: any) => ({
+            investor_id: a.investor_id,
+            amount: a.amount,
+          }));
+        }
+      }
+      if (!persistedPlan) {
+        this.logger.error(
+          "Resume requested but persisted allocation plan is missing",
+          {
+            offeringId,
+            periodId: period.id,
+            runId: run.id,
+          },
+        );
+        throw Errors.conflict(
+          `Distribution run ${run.id} cannot be resumed: persisted allocation plan is missing`,
+        );
+      }
     }
 
     // 3. Acquire balances with retry and classification
     let balances: BalanceRow[] = [];
-    try {
-      balances = await this.withRetry(() =>
-        this.fetchBalances(offeringId, period),
-      );
-    } catch (err) {
-      const failure = classifyStellarRPCFailure(err, {
-        operation: "fetchBalances",
-        offeringId,
-        periodId: period.id,
-      });
-      this.logger.error("Failed to acquire balances", {
-        offeringId,
-        periodId: period.id,
-        error: err instanceof Error ? err.message : String(err),
-        failureClass: failure.class,
-      });
-      throw Errors.serviceUnavailable(
-        `Failed to acquire balances: ${failure.class}`,
-      );
-    }
+    let rounded: Array<{ investor_id: string; amount: Decimal; rawShare: Decimal }>;
+    if (persistedPlan) {
+      // Resume path: use the persisted plan verbatim. Do NOT refetch balances
+      // or recompute shares — that would change the proration base.
+      rounded = persistedPlan.map((p) => ({
+        investor_id: p.investor_id,
+        amount: new Decimal(p.amount),
+        rawShare: new Decimal(p.amount),
+      }));
+    } else {
+      try {
+        balances = await this.withRetry(() =>
+          this.fetchBalances(offeringId, period),
+        );
+      } catch (err) {
+        const failure = classifyStellarRPCFailure(err, {
+          operation: "fetchBalances",
+          offeringId,
+          periodId: period.id,
+        });
+        this.logger.error("Failed to acquire balances", {
+          offeringId,
+          periodId: period.id,
+          error: err instanceof Error ? err.message : String(err),
+          failureClass: failure.class,
+        });
+        throw Errors.serviceUnavailable(
+          `Failed to acquire balances: ${failure.class}`,
+        );
+      }
 
-    // 4. Run the SHARED pure calculation logic
-    // Both real distribution and previews use this exact same function,
-    // guaranteeing that preview totals equal actual-run totals when inputs are unchanged.
-    const calculation = calculateDistributionPayouts(balances, revenueAmount);
-    const { rounded } = calculation;
+      // 4. Run the SHARED pure calculation logic
+      // Both real distribution and previews use this exact same function,
+      // guaranteeing that preview totals equal actual-run totals when inputs are unchanged.
+      const calculation = calculateDistributionPayouts(balances, revenueAmount);
+      rounded = calculation.rounded;
+    }
 
     // 5. Ensure distribution run exists and is in 'processing' state
     let frozenFxRateId: string | undefined =
@@ -529,6 +569,39 @@ class DistributionEngine {
         throw Errors.internal(
           `Failed to initialize distribution run: ${failure.class}`,
         );
+      }
+
+      // Persist the computed allocation plan so a resume executes the same
+      // plan rather than recomputing from fresh balances.
+      if (
+        typeof this.distributionRepo.createAllocations === "function"
+      ) {
+        try {
+          await this.withRetry(() =>
+            this.distributionRepo.createAllocations(
+              run.id,
+              rounded.map((r) => ({
+                investor_id: r.investor_id,
+                amount: r.amount.toString(),
+              })),
+            ),
+          );
+        } catch (err) {
+          const failure = classifyStellarRPCFailure(err, {
+            operation: "createAllocations",
+            offeringId,
+            periodId: period.id,
+          });
+          this.logger.error("Failed to persist distribution allocations", {
+            offeringId,
+            runId: run.id,
+            error: err instanceof Error ? err.message : String(err),
+            failureClass: failure.class,
+          });
+          throw Errors.internal(
+            `Failed to persist distribution allocations: ${failure.class}`,
+          );
+        }
       }
     } else if (run.status !== "processing") {
       try {
@@ -704,6 +777,46 @@ class DistributionEngine {
             }
           }
         }
+      }
+    }
+
+    // 7. Post-completion invariant: sum(payouts) must equal run.total_amount.
+    // If it does not, mark the run failed and log the discrepancy.
+    if (failedPayouts.length === 0 && !hasBatchFailure) {
+      try {
+        const finalPayouts = await this.distributionRepo.getPayoutsForRun(
+          run.id,
+        );
+        const payoutSum = finalPayouts.reduce(
+          (sum: Decimal, p: any) => sum.add(new Decimal(p.amount)),
+          new Decimal("0"),
+        );
+        const expected = new Decimal(amtStr);
+        if (!payoutSum.equals(expected)) {
+          const discrepancy = payoutSum.subtract(expected);
+          this.logger.error(
+            "Distribution payout sum does not match run total_amount",
+            {
+              offeringId,
+              runId: run.id,
+              periodId: period.id,
+              expected: expected.toString(),
+              actual: payoutSum.toString(),
+              discrepancy: discrepancy.toString(),
+            },
+          );
+          hasBatchFailure = true;
+        }
+      } catch (err) {
+        this.logger.error(
+          "Failed to verify distribution payout sum invariant",
+          {
+            offeringId,
+            runId: run.id,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        );
+        hasBatchFailure = true;
       }
     }
 
